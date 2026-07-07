@@ -45,6 +45,7 @@ GENERATOR_FOLDERS_BY_REPETITION = {
     "yes": {
         "gpt2": ("encoding_mistral", "gpt2"),
         "mistral": ("encoding_mistral", "mistral-base"),
+        "mistral-base": ("encoding_mistral", "mistral-base"),
         "mpt": ("encoding_mistral", "mpt"),
         "llama-chat": ("encoding_mistral", "chat_models/llama-chat"),
         "llama-chat-instruct": ("encoding_mistral-instruct", "chat_models/llama-chat"),
@@ -55,6 +56,7 @@ GENERATOR_FOLDERS_BY_REPETITION = {
 
 DATASET_MODEL_NAMES = {
     "llama-chat-instruct": "llama-chat",
+    "mistral-base": "mistral",
 }
 
 RAID_TRAIN_URL = "https://huggingface.co/datasets/liamdugan/raid/resolve/main/train.csv"
@@ -99,6 +101,20 @@ def parse_args():
         type=str,
         default="fast_detect_gpt",
         help="Folder name under full_dataset_exp/baselines.",
+    )
+    parser.add_argument(
+        "--text-kind",
+        choices=["both", "llm"],
+        default="both",
+        help="Score paired human/LLM texts, or only generated LLM texts.",
+    )
+    parser.add_argument(
+        "--allow-cross-root-generators",
+        action="store_true",
+        help=(
+            "Allow requested generators whose original folders belong to another "
+            "encoding root, writing them under --encoding-root instead."
+        ),
     )
     parser.add_argument(
         "--no-4bit",
@@ -216,6 +232,28 @@ def score_domain(data, domain, output_dir, model, tokenizer, args):
     llm_path = output_dir / f"llm_{domain}.pt"
     meta_path = output_dir / f"metadata_{domain}.json"
 
+    if args.text_kind == "llm":
+        if llm_path.exists() and not args.overwrite:
+            print(f"Skipping {domain}: existing LLM file found in {output_dir}")
+            return
+
+        llm_scores = []
+        for start in range(0, len(data), args.batch_size):
+            batch = data[start:start + args.batch_size]
+            for pair in tqdm(batch, desc=f"{domain} {start}-{start + len(batch)}"):
+                llm_scores.append(
+                    fast_detect_score(pair["llm"], model, tokenizer, args.device, args.max_length)
+                )
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(llm_scores, llm_path)
+        print(f"Saved Fast-DetectGPT LLM scores for {domain} to {output_dir}")
+        return
+
     if human_path.exists() and llm_path.exists() and not args.overwrite:
         print(f"Skipping {domain}: existing files found in {output_dir}")
         return
@@ -288,7 +326,7 @@ def output_dir_for(args, generator):
     expected_root, folder = generator_folders_for(args.repetition_penalty).get(
         generator, (args.encoding_root, generator)
     )
-    if expected_root != args.encoding_root:
+    if expected_root != args.encoding_root and not args.allow_cross_root_generators:
         raise ValueError(
             f"Generator {generator!r} belongs to {expected_root}, not {args.encoding_root}."
         )
